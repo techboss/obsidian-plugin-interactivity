@@ -25,22 +25,169 @@ interface InteractivityPluginSettings {
     regexpCleaner: string;
     shortcuts: string;
     advanced: boolean;
+    blockDelimiter: string;
+    useJsonProtocol: boolean;
+}
+
+// JSON message structure for Python communication
+interface PythonMessage {
+    command: string;
+    frontmatter: Record<string, any>;
+    context: {
+        notePath: string;
+        cursorLine: number;
+        selectedText?: string;
+    };
+}
+
+// Extract YAML frontmatter from note content
+function extractFrontmatter(content: string): Record<string, any> {
+    const match = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!match) return {};
+
+    const yaml = match[1];
+    const result: Record<string, any> = {};
+
+    // Simple YAML parsing for key: value pairs
+    for (const line of yaml.split('\n')) {
+        const keyValue = line.match(/^(\w+):\s*(.*)$/);
+        if (keyValue) {
+            const [, key, value] = keyValue;
+            // Handle quoted strings
+            if (value.startsWith('"') && value.endsWith('"')) {
+                result[key] = value.slice(1, -1);
+            } else if (value.startsWith("'") && value.endsWith("'")) {
+                result[key] = value.slice(1, -1);
+            } else if (value === 'true') {
+                result[key] = true;
+            } else if (value === 'false') {
+                result[key] = false;
+            } else if (!isNaN(Number(value)) && value !== '') {
+                result[key] = Number(value);
+            } else {
+                result[key] = value;
+            }
+        }
+    }
+    return result;
+}
+
+// Find block content between %%% delimiters containing the cursor
+function findBlockAtCursor(editor: Editor, delimiter: string): { content: string; startLine: number; endLine: number } | null {
+    const cursor = editor.getCursor();
+    const totalLines = editor.lineCount();
+
+    // Find all delimiter positions (more lenient matching)
+    const delimiterLines: number[] = [];
+    const delimTrimmed = delimiter.trim();
+
+    for (let i = 0; i < totalLines; i++) {
+        const line = editor.getLine(i);
+        const lineTrimmed = line.trim();
+        // Match if line equals delimiter, or starts with delimiter (allowing trailing content)
+        if (lineTrimmed === delimTrimmed || lineTrimmed.startsWith(delimTrimmed + ' ') || lineTrimmed === delimTrimmed) {
+            delimiterLines.push(i);
+        }
+    }
+
+    // Need at least 2 delimiters for a block
+    if (delimiterLines.length < 2) return null;
+
+    // Find which block the cursor is in (or on)
+    // Try paired matching first
+    for (let i = 0; i < delimiterLines.length - 1; i++) {
+        const startLine = delimiterLines[i];
+        const endLine = delimiterLines[i + 1];
+
+        // Cursor is inside or on the block delimiters
+        if (cursor.line >= startLine && cursor.line <= endLine) {
+            const lines: string[] = [];
+            for (let j = startLine + 1; j < endLine; j++) {
+                lines.push(editor.getLine(j));
+            }
+
+            return {
+                content: lines.join('\n'),
+                startLine,
+                endLine
+            };
+        }
+    }
+
+    return null;
+}
+
+// Apply shortcut transformations to content
+function applyShortcuts(content: string, shortcuts: string): string {
+    const lines = content.split('\n');
+    const firstLine = lines[0] ?? '';
+    let matchedShortcutLen = 0;
+    let result = content;
+
+    for (const shortcutDef of shortcuts.split('\n')) {
+        if (!shortcutDef.trim()) continue;
+
+        const match = shortcutDef.match(/(.*?)\s*->\s*(.*)/);
+        if (!match) continue;
+
+        const trigger = match[1];
+        const template = match[2];
+
+        if (firstLine.startsWith(trigger) && trigger.length > matchedShortcutLen) {
+            matchedShortcutLen = trigger.length;
+
+            // Extract parameter: everything after trigger, across all lines
+            let paramLines: string[] = [];
+            const firstLineRemainder = firstLine.slice(trigger.length).trimStart();
+            if (firstLineRemainder) paramLines.push(firstLineRemainder);
+            paramLines.push(...lines.slice(1));
+
+            let param = paramLines.join('\n').trim();
+            param = param.replace(/^\n+|\n+$/g, ''); // Trim leading/trailing blank lines
+
+            // Check if ##param## is already inside triple quotes in the template
+            const alreadyQuoted = template.includes('"""##param##') ||
+                                  template.includes("'''##param##") ||
+                                  template.includes('##param##"""') ||
+                                  template.includes("##param##'''");
+
+            if (alreadyQuoted) {
+                // Template already has quotes - just do simple replacement
+                // Escape internal triple quotes in the param
+                param = param.replace(/"""/g, '\\"""');
+                result = template.replace(/##param##/g, param);
+            } else {
+                // Template needs quotes added around param
+                param = param.replace(/"""/g, '\\"""'); // Escape internal triple quotes
+                const useRaw = template.includes('r##param##');
+                const quotedParam = (useRaw ? 'r' : '') + '"""' + param + '"""';
+
+                result = template
+                    .replace(/##param##/g, quotedParam)
+                    .replace(/r##param##/g, quotedParam);
+            }
+        }
+    }
+
+    return result;
 }
 
 const DEFAULT_SETTINGS: InteractivityPluginSettings = {
     shellExec: 'python',
-    shellParams: '-iq\n##plugin##py_manager.py\n',
+    shellParams: '-uq\n##plugin##py_manager.py\n',
     executeOnLoad: 'openai.api_key = "sk-"\n',
     notice: false,
     decorateMultiline: true,
-    linesToSuppress: 1,
+    linesToSuppress: 0,
     separatedShells: false,
     prependOutput: '>>> ',
     enviromentVariables: 'PYTHONIOENCODING=utf8\n',
     executeOnUnload: 'exit()\n',
     regexpCleaner: '^((>>> )|(\\.\\.\\. ))+',
-    shortcuts: '@ -> ##param##\n',
+    shortcuts: '@ -> ##param##\n@@ -> chat(##param##)\n',
     advanced: false,
+    blockDelimiter: '%%%',
+    useJsonProtocol: true,
 };
 
 const __EVAL = (s: string) => (0, eval)(`void (__EVAL = ${__EVAL.toString()}); ${s}`);
@@ -95,85 +242,167 @@ export default class InteractivityPlugin extends Plugin {
 
                 const routine = (that: InteractivityPlugin) => {
                     const activeEditor = that.app.workspace.activeEditor?.editor;
-                    if (!activeEditor) return;
+                    if (!activeEditor) {
+                        that.statusBarItemEl.setText('');
+                        return;
+                    }
 
                     let selection = activeEditor.getSelection();
-                    let lines = selection.split('\n');
-                    let firstLine = lines[0] ?? '';
+                    let commandText = '';
+                    let blockInfo: { startLine: number; endLine: number } | null = null;
 
-                    // --- Multi-line shortcut detection & parameter building ---
-                    let command = '';
-                    let matchedShortcutLen = 0;
-
-                    for (const shortcutDef of that.settings.shortcuts.split('\n')) {
-                        if (!shortcutDef.trim()) continue;
-
-                        const match = shortcutDef.match(/(.*?)\s*->\s*(.*)/);
-                        if (!match) continue;
-
-                        const trigger = match[1];
-                        const template = match[2];
-
-                        if (firstLine.startsWith(trigger) && trigger.length > matchedShortcutLen) {
-                            matchedShortcutLen = trigger.length;
-
-                            // Extract parameter: everything after trigger, across all lines
-                            let paramLines: string[] = [];
-                            const firstLineRemainder = firstLine.slice(trigger.length).trimStart();
-                            if (firstLineRemainder) paramLines.push(firstLineRemainder);
-                            paramLines.push(...lines.slice(1));
-
-                            let param = paramLines.join('\n').trim();
-                            param = param.replace(/^\n+|\n+$/g, ''); // Trim leading/trailing blank lines
-                            param = param.replace(/"""/g, '\\"""'); // Escape internal triple quotes
-
-                            const useRaw = template.includes('r##param##');
-                            const quotedParam = (useRaw ? 'r' : '') + '"""' + param + '"""';
-
-                            command = template
-                                .replace(/##param##/g, quotedParam)
-                                .replace(/r##param##/g, quotedParam);
-
-                            selection = command;
+                    // Priority 1: Check for %%% block at cursor (if no selection)
+                    if (!selection.trim() && that.settings.blockDelimiter) {
+                        const block = findBlockAtCursor(activeEditor, that.settings.blockDelimiter);
+                        if (block) {
+                            // Apply shortcut transformations to block content
+                            commandText = applyShortcuts(block.content, that.settings.shortcuts);
+                            blockInfo = { startLine: block.startLine, endLine: block.endLine };
                         }
                     }
 
-                    // Fallback: no shortcut → send raw selection
-                    if (!command) {
-                        selection = lines.join('\n');
+                    // Priority 2: Use selection - strip %%% delimiters if present
+                    if (!commandText && selection.trim()) {
+                        const delimiter = that.settings.blockDelimiter;
+                        if (delimiter && selection.includes(delimiter)) {
+                            // Strip delimiters and extract content between them
+                            const delimRegex = new RegExp(`^\\s*${delimiter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n([\\s\\S]*?)\\n\\s*${delimiter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`);
+                            const match = selection.match(delimRegex);
+                            if (match) {
+                                // Apply shortcut transformations to block content
+                                commandText = applyShortcuts(match[1], that.settings.shortcuts);
+                            }
+                        }
+                    }
+
+                    // Priority 3: Selection with shortcut processing
+                    if (!commandText && selection.trim()) {
+                        commandText = applyShortcuts(selection, that.settings.shortcuts);
+                    }
+
+                    if (!commandText.trim()) {
+                        that.statusBarItemEl.setText('');
+                        if (!selection.trim()) {
+                            new Notice('No %%% block found at cursor position');
+                        }
+                        return;
                     }
 
                     // Move cursor to end of current line
                     activeEditor.setCursor({ line: currentLine, ch: activeEditor.getLine(currentLine).length });
 
                     // Execute
-                    if (selection.trim()) {
-                        if (that.advanced) {
-                            that.allSubprocesses[fileKey].stdin.write(selection + '\n');
+                    if (that.advanced) {
+                        if (that.settings.useJsonProtocol) {
+                            // Build JSON message with frontmatter and context
+                            const noteContent = that.app.workspace.getActiveFile()
+                                ? that.app.vault.cachedRead(that.app.workspace.getActiveFile()!)
+                                : Promise.resolve('');
+
+                            noteContent.then((content) => {
+                                const message: PythonMessage = {
+                                    command: commandText,
+                                    frontmatter: extractFrontmatter(content),
+                                    context: {
+                                        notePath: that.app.workspace.getActiveFile()?.path ?? '',
+                                        cursorLine: currentLine,
+                                        selectedText: selection || undefined
+                                    }
+                                };
+                                that.allSubprocesses[fileKey].stdin.write(JSON.stringify(message) + '\n');
+                            });
                         } else {
-                            let output: any;
-                            try {
-                                output = __EVAL(selection);
-                            } catch (e) {
-                                output = e;
-                            }
-                            if (output !== undefined && that.processingNote === that.app.workspace.getActiveFile()?.path) {
-                                that.insertText(activeEditor, output.toString(), that.settings.decorateMultiline, that.settings.prependOutput, that.settings.notice);
-                                that.statusBarItemEl.setText('');
-                            }
+                            // Legacy plain text protocol
+                            that.allSubprocesses[fileKey].stdin.write(commandText + '\n');
+                        }
+                    } else {
+                        let output: any;
+                        try {
+                            output = __EVAL(commandText);
+                        } catch (e) {
+                            output = e;
+                        }
+                        if (output !== undefined && that.processingNote === that.app.workspace.getActiveFile()?.path) {
+                            that.insertText(activeEditor, output.toString(), that.settings.decorateMultiline, that.settings.prependOutput, that.settings.notice);
+                            that.statusBarItemEl.setText('');
                         }
                     }
                 };
 
                 this.processingNote = this.app.workspace.getActiveFile()?.path ?? '';
-                this.statusBarItemEl.setText('Interactivity is busy⏳');
 
                 if (this.byEnter) {
-                    // Handle legacy Enter-trigger (single-line shortcut on previous line)
                     const lineIdx = cursor.line - 1;
-                    const lineText = editor.getLine(lineIdx);
-                    let hasMatch = false;
+                    const lineText = editor.getLine(lineIdx).trim();
+                    const delimiter = this.settings.blockDelimiter;
 
+                    // Check if previous line is a closing %%% delimiter
+                    if (delimiter && lineText === delimiter) {
+                        // Count all %%% delimiters above this line
+                        // If count is ODD, this line is a CLOSING delimiter (execute block)
+                        // If count is EVEN, this line is an OPENING delimiter (do nothing)
+                        let delimiterCount = 0;
+                        let lastDelimiterLine = -1;
+                        for (let i = 0; i < lineIdx; i++) {
+                            if (editor.getLine(i).trim() === delimiter) {
+                                delimiterCount++;
+                                lastDelimiterLine = i;
+                            }
+                        }
+
+                        // If odd count above, this is a closing delimiter
+                        if (delimiterCount % 2 === 1 && lastDelimiterLine >= 0) {
+                            const openingLine = lastDelimiterLine;
+                            // Found a complete block - extract content
+                            const blockLines: string[] = [];
+                            for (let i = openingLine + 1; i < lineIdx; i++) {
+                                blockLines.push(editor.getLine(i));
+                            }
+                            const rawBlockContent = blockLines.join('\n');
+
+                            if (rawBlockContent.trim()) {
+                                // Apply shortcut transformations to block content
+                                const blockContent = applyShortcuts(rawBlockContent, this.settings.shortcuts);
+
+                                this.statusBarItemEl.setText('Interactivity is busy⏳');
+
+                                // Remove the newline that Enter just created
+                                editor.replaceRange('', { line: lineIdx, ch: editor.getLine(lineIdx).length }, { line: cursor.line, ch: cursor.ch });
+
+                                // Move cursor to end of closing delimiter line
+                                editor.setCursor({ line: lineIdx, ch: editor.getLine(lineIdx).length });
+
+                                // Execute with block content
+                                const that = this;
+                                if (this.settings.useJsonProtocol && this.advanced) {
+                                    const noteContent = this.app.workspace.getActiveFile()
+                                        ? this.app.vault.cachedRead(this.app.workspace.getActiveFile()!)
+                                        : Promise.resolve('');
+
+                                    noteContent.then((content) => {
+                                        const message: PythonMessage = {
+                                            command: blockContent,
+                                            frontmatter: extractFrontmatter(content),
+                                            context: {
+                                                notePath: that.app.workspace.getActiveFile()?.path ?? '',
+                                                cursorLine: lineIdx,
+                                                selectedText: undefined
+                                            }
+                                        };
+                                        that.allSubprocesses[fileKey].stdin.write(JSON.stringify(message) + '\n');
+                                    });
+                                } else if (this.advanced) {
+                                    this.allSubprocesses[fileKey].stdin.write(blockContent + '\n');
+                                }
+                                return;
+                            }
+                        }
+                        // Opening %%% without content or incomplete block - do nothing
+                        return;
+                    }
+
+                    // Legacy shortcut handling (e.g., @ -> command)
+                    let hasMatch = false;
                     for (const def of this.settings.shortcuts.split('\n')) {
                         const m = def.match(/(.*?)\s*->\s*(.*)/);
                         if (m && lineText.startsWith(m[1])) {
@@ -183,6 +412,8 @@ export default class InteractivityPlugin extends Plugin {
                     }
 
                     if (!hasMatch) return;
+
+                    this.statusBarItemEl.setText('Interactivity is busy⏳');
 
                     if (Platform.isMobile) {
                         setTimeout(() => {
@@ -194,6 +425,7 @@ export default class InteractivityPlugin extends Plugin {
                         routine(this);
                     }
                 } else {
+                    this.statusBarItemEl.setText('Interactivity is busy⏳');
                     routine(this);
                 }
             },
@@ -273,7 +505,7 @@ export default class InteractivityPlugin extends Plugin {
             const basePath = this.app.vault.adapter instanceof FileSystemAdapter
                 ? (this.app.vault.adapter as FileSystemAdapter).getBasePath()
                 : '';
-            const pluginDir = normalizePath(basePath + '/' + this.manifest.dir + '/1').replace(/\/$/, '');
+            const pluginDir = normalizePath(basePath + '/' + this.manifest.dir).replace(/\/$/, '') + '/';
 
             const params = this.settings.shellParams
                 ? this.settings.shellParams.replace(/##plugin##/g, pluginDir).split('\n')
@@ -405,6 +637,26 @@ class InteractivitySettingTab extends PluginSettingTab {
                     this.plugin.saveSettings();
                 }));
 
+        new Setting(containerEl)
+            .setName('Block delimiter')
+            .setDesc('Delimiter for multi-line input blocks (e.g., %%%). Place cursor inside block and execute.')
+            .addText((t) => t
+                .setValue(this.plugin.settings.blockDelimiter)
+                .onChange((v) => {
+                    this.plugin.settings.blockDelimiter = v;
+                    this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Use JSON protocol')
+            .setDesc('Send commands as JSON with frontmatter and context (requires compatible Python handler)')
+            .addToggle((t) => t
+                .setValue(this.plugin.settings.useJsonProtocol)
+                .onChange((v) => {
+                    this.plugin.settings.useJsonProtocol = v;
+                    this.plugin.saveSettings();
+                }));
+
         if (Platform.isMobile) return;
 
         // Advanced toggle and settings (unchanged structure)
@@ -419,36 +671,87 @@ class InteractivitySettingTab extends PluginSettingTab {
                     this.display();
                 }));
 
-        // Define advanced settings here (same as original)
-        const advancedSettings = [
-            ['Shell executable path', 'shellExec', 'text'],
-            ['Environment variables', 'enviromentVariables', 'textarea'],
-            ['Shell CLI arguments', 'shellParams', 'textarea'],
-            ['Commands on load', 'executeOnLoad', 'textarea'],
-            ['Commands on unload', 'executeOnUnload', 'textarea'],
-            ['Separate shells per note', 'separatedShells', 'toggle'],
-            ['Output RegExp cleaner', 'regexpCleaner', 'text'],
-            ['Lines to suppress', 'linesToSuppress', 'text'],
-        ];
+        // Advanced settings - only visible when advanced mode is enabled
+        const hiddenClass = this.plugin.settings.advanced ? '' : 'hidden';
 
-        advancedSettings.forEach(([name, key, type]) => {
-            const setting = new Setting(containerEl).setName(name as string);
-            if (type === 'toggle') {
-                setting.addToggle((t) => t
-                    .setValue((this.plugin.settings as any)[key])
-                    .onChange(async (v) => {
-                        (this.plugin.settings as any)[key] = v;
-                        await this.plugin.saveSettings();
-                    }));
-            } else {
-                (type === 'textarea' ? setting.addTextArea : setting.addText)((c) => c
-                    .setValue((this.plugin.settings as any)[key])
-                    .onChange(async (v) => {
-                        (this.plugin.settings as any)[key] = v;
-                        await this.plugin.saveSettings();
-                    }));
-            }
-            setting.settingEl.addClass(this.plugin.settings.advanced ? '' : 'hidden');
-        });
+        const shellExecSetting = new Setting(containerEl)
+            .setName('Shell executable path')
+            .addText((t) => t
+                .setValue(this.plugin.settings.shellExec)
+                .onChange(async (v) => {
+                    this.plugin.settings.shellExec = v;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) shellExecSetting.settingEl.addClass(hiddenClass);
+
+        const envVarsSetting = new Setting(containerEl)
+            .setName('Environment variables')
+            .addTextArea((t) => t
+                .setValue(this.plugin.settings.enviromentVariables)
+                .onChange(async (v) => {
+                    this.plugin.settings.enviromentVariables = v;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) envVarsSetting.settingEl.addClass(hiddenClass);
+
+        const shellParamsSetting = new Setting(containerEl)
+            .setName('Shell CLI arguments')
+            .addTextArea((t) => t
+                .setValue(this.plugin.settings.shellParams)
+                .onChange(async (v) => {
+                    this.plugin.settings.shellParams = v;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) shellParamsSetting.settingEl.addClass(hiddenClass);
+
+        const onLoadSetting = new Setting(containerEl)
+            .setName('Commands on load')
+            .addTextArea((t) => t
+                .setValue(this.plugin.settings.executeOnLoad)
+                .onChange(async (v) => {
+                    this.plugin.settings.executeOnLoad = v;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) onLoadSetting.settingEl.addClass(hiddenClass);
+
+        const onUnloadSetting = new Setting(containerEl)
+            .setName('Commands on unload')
+            .addTextArea((t) => t
+                .setValue(this.plugin.settings.executeOnUnload)
+                .onChange(async (v) => {
+                    this.plugin.settings.executeOnUnload = v;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) onUnloadSetting.settingEl.addClass(hiddenClass);
+
+        const separatedShellsSetting = new Setting(containerEl)
+            .setName('Separate shells per note')
+            .addToggle((t) => t
+                .setValue(this.plugin.settings.separatedShells)
+                .onChange(async (v) => {
+                    this.plugin.settings.separatedShells = v;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) separatedShellsSetting.settingEl.addClass(hiddenClass);
+
+        const regexpSetting = new Setting(containerEl)
+            .setName('Output RegExp cleaner')
+            .addText((t) => t
+                .setValue(this.plugin.settings.regexpCleaner)
+                .onChange(async (v) => {
+                    this.plugin.settings.regexpCleaner = v;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) regexpSetting.settingEl.addClass(hiddenClass);
+
+        const linesToSuppressSetting = new Setting(containerEl)
+            .setName('Lines to suppress')
+            .addText((t) => t
+                .setValue(String(this.plugin.settings.linesToSuppress))
+                .onChange(async (v) => {
+                    this.plugin.settings.linesToSuppress = parseInt(v) || 0;
+                    await this.plugin.saveSettings();
+                }));
+        if (hiddenClass) linesToSuppressSetting.settingEl.addClass(hiddenClass);
     }
 }

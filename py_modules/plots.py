@@ -3,21 +3,19 @@
 try:
 	import matplotlib
 	matplotlib.use('Agg')
-
 	import matplotlib.pyplot as plt
+	import io
+	import base64
+	_HAS_MATPLOTLIB = True
 except ImportError:
-	print("""
-The matplotlib library is required to run plots.py
-You can install it using pip:
-pip install matplotlib
-""")
-	exit(1)
-import io
-import base64
+	_HAS_MATPLOTLIB = False
 
 
 # embeds a plot
 def plot(*args, **kwargs) -> None:
+	if not _HAS_MATPLOTLIB:
+		print("Error: matplotlib not installed. Run: pip install matplotlib")
+		return
 	plt.set_loglevel('WARNING')
 	plt.figure(figsize=(6, 4))
 	plt.plot(*args, **kwargs)
